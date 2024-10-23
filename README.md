@@ -1,11 +1,11 @@
-# adnexal_masses_DL
+# deep_classifier
 
 ## Overview
 
 ## How to run
 
 ```python
-python adnexalv6.py --config ./config/template.yml
+python run.py --config ./config/template.yml
 ```
 
 ## Architecture
@@ -29,7 +29,7 @@ root
         |--params.py
   |--utils
         |--utility codes and helper functions
-  |--adnexal.py
+  |--run.py
 
 ```
 
@@ -43,4 +43,4 @@ root
 
 ## Outputs
 
-"# deep_classifier" 
+"# " 
