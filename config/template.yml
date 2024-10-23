@@ -1,0 +1,54 @@
+model:
+  name: pretrained_models
+  subname: resnet18 # subname is used only for pretrained_models
+  dropout: 0.3
+  out_channels: [1024, 512, 256]
+  
+train:
+  epochs: 200
+  lr: 0.001
+  weight_decay: 0.001
+  save_weights_only: True
+  save_best_model: True 
+  save_last_model: False
+  period: 20
+  early_stop: True
+  patience: 50
+  batch_size: 32
+  one_hot: True
+  n_classes: 2
+  
+test:
+  base_model_name: TEMP_pretrained_models_2024-10-17_11-27-59
+  type: both # option: best, average, both
+
+phase: both # either train, test, or both
+  
+directories:
+  root: /research/m324371/Project/adnexal/
+  excel_dir: /research/m324371/Project/adnexal/adnexal_dataset_all.xlsx
+  train_im_dir: /research/m324371/Project/adnexal/dataset/train/
+  val_im_dir: /research/m324371/Project/adnexal/dataset/train/
+  test_im_dir: /research/m324371/Project/adnexal/dataset/test/
+  result_dir: /research/m324371/Project/adnexal/results/
+  
+data:
+  only_adnexal: False
+  only_fluid: True
+  only_solid: True
+  draw_bbox: False
+  crop_roi: True
+  margin: 200
+  resize: True
+  keep_aspect_ratio: True
+  target_size: [224, 224]
+  concat: ["image", "fluid", "solid"]
+  
+loss:
+  name: ce
+  
+normalize:
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+  
+  
