@@ -2,7 +2,6 @@
 # coding: utf-8
 """
 Author: Mrinal Kanti Dhar
-
 October 17, 2024
 """
 
@@ -12,6 +11,10 @@ October 17, 2024
 # * v4: (Obsolete) used to train with customized models
 # * v5: Dataloader updated. Now, it can perform - different image manipulations, roi extractions, and create multi-channel images.
 # * v6: Run code from config file
+# * v7: Tensorboard added with both loss and metrics
+# * 701: TTA added
+# * 702: Fixed class activation before thresholding
+# * 703: K-fold is sent to config file
 
 print('************ The code is loaded ************')
 
@@ -83,7 +86,6 @@ config = Box(config)
 # ### Parameters
 #%% Parameters
 BASE_MODEL = config.model.name
-MODEL_NAME = config.model.name  # used only for pretrained models
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 EPOCHS = config.train.epochs
@@ -94,6 +96,7 @@ WEIGHT_DECAY = config.train.weight_decay #1e-5
 SAVE_WEIGHTS_ONLY = config.train.save_weights_only
 SAVE_BEST_MODEL = config.train.save_best_model
 SAVE_LAST_MODEL = config.train.save_last_model
+SAVE_INIT_MODEL = config.train.save_initial_model # useful in cross-validation, save a copy of the base model only
 PERIOD = config.train.period # periodically save checkpoints
 EARLY_STOP = config.train.early_stop
 PATIENCE = config.train.patience # for early stopping
@@ -127,15 +130,19 @@ test_im_dir = config.directories.test_im_dir
 
 # ### Transforms
 # Normalization
-normalize_transform = normalization.normalize() # always normalize
+normalize_transform = normalization.normalize(config) # always normalize
 
 # Augmentation
 transform = augmentations.transforms()
 
 # ### Base model name
 base_timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-base_model_name = BASE_MODEL + '_' + base_timestamp # general name for all k-fold models
-print("Base model name:", base_model_name)
+if BASE_MODEL == "base_models" or BASE_MODEL == "BaseModelSepIn":
+    base_model_name = BASE_MODEL + '_' + config.model.subname + '_' + base_timestamp # general name for all k-fold models
+    print("Base model name:", base_model_name)
+else:
+    base_model_name = BASE_MODEL + '_' + base_timestamp # general name for all k-fold models
+    print("Base model name:", base_model_name)
 
 
 # ### Prepare preprocessing dictionary
@@ -194,7 +201,7 @@ def save(model_path, epoch, model_state_dict, optimizer_state_dict):
 # Dynamically get the model class from nets
 get_model = getattr(nets, config.model.name) # get_model is a model class, not an object
 
-params = model_params(config.model.name) # initialize the model with other parameters 
+params = model_params(config.model.name, config) # initialize the model with other parameters 
 
 base_model = get_model(**params)
 
@@ -205,12 +212,25 @@ base_model = get_model(**params)
 
 if config.phase == "train" or config.phase == "both":
 
+    # Initialize summary writer for tensorboard
+    writter_timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    writer_dir = os.path.join(result_dir, base_model_name, 'logs')
+    writer = SummaryWriter(os.path.join(writer_dir, 'fashion_trainer_{}'.format(writter_timestamp)))
+
     # Save the preprocessing dictionary
     df_pp_dict = pd.DataFrame(list(pp_dict.items()), columns=["Parameter", "Value"]) # convert pp_dict to a DataFrame for saving
     pp_save_dir = os.path.join(result_dir, base_model_name)
     os.makedirs(pp_save_dir, exist_ok=True)
     df_pp_dict.to_excel(os.path.join(pp_save_dir, 'pp_dict_' + base_model_name + '.xlsx'), index=False)
-       
+    
+    # Save the config file
+    with open(os.path.join(pp_save_dir, "config.yaml"), "w") as file:
+      yaml.dump(config.to_dict(), file, default_flow_style=False)
+
+    # Save initial model
+    if SAVE_INIT_MODEL: torch.save(base_model, os.path.join(pp_save_dir, "initial_model.pth"))
+    
+    
     ### Uncomment to retrain
     
     # retrain_model_name = 'name_of_the_save_model'
@@ -228,12 +248,13 @@ if config.phase == "train" or config.phase == "both":
     
     # Link: https://pytorch.org/tutorials/beginner/introyt/trainingyt.html
     
-    show_report = 50 # reports loss after every 'show_report' batches in an epoch
+    # show_report = 50 # reports loss after every 'show_report' batches in an epoch
     
     # def train_one_epoch(epoch_index, tb_writer):
     def train_one_epoch(epoch_index):
         running_loss = 0.
-        last_loss = 0.
+        valid_batches = 0
+        train_gt, train_pred, train_prob = [], [], []
     
         # Here, we use enumerate(training_loader) instead of
         # iter(training_loader) so that we can track the batch
@@ -242,9 +263,11 @@ if config.phase == "train" or config.phase == "both":
             # Every data instance is an input + label pair
     
             # # Skip this iteration if this batch contains None
-            if None in (inputs, labels):
-              continue
+            # if None in (inputs, labels):
+            #   continue
     
+            valid_batches += 1
+            
             # Moving to GPU
             inputs = inputs.to(DEVICE)
             labels = labels.to(DEVICE)
@@ -254,7 +277,7 @@ if config.phase == "train" or config.phase == "both":
     
             # Make predictions for this batch
             outputs = model(inputs)
-    
+            
             # Compute the loss and its gradients        
             loss = loss_fn(outputs, labels)
             loss.backward()
@@ -264,27 +287,50 @@ if config.phase == "train" or config.phase == "both":
     
             # Gather data and report
             running_loss += loss.item()
+
+            # Collect predictions and probabilities
+            prob = torch.softmax(outputs, dim=1) if ONE_HOT else torch.sigmoid(outputs)
+            if ONE_HOT:
+                pred = torch.argmax(prob, dim=1).cpu().numpy().tolist() # making prediction from probability
+                lbls = torch.argmax(labels, dim=1).cpu().numpy().tolist()
+                prob_ = prob[:, 1].detach().clone().cpu().numpy().tolist() #<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< check if for binary classification
+            else:
+                pred = (prob > 0.5).float().cpu().numpy().tolist() # making prediction from probability
+                lbls = labels.cpu().numpy().tolist()
+                prob_ = prob.detach().clone().cpu().numpy().tolist()
     
-            
-            if i % show_report == show_report-1:
-                # For loss
-                last_loss = running_loss / show_report # loss per batch
-                # print('  batch {} loss: {}'.format(i + 1, last_loss))
-                tb_x = epoch_index * len(train_loader) + i + 1
-                tb_writer.add_scalar('Loss/train', last_loss, tb_x)
-                running_loss = 0.
-    
+            train_gt.extend(lbls)
+            train_pred.extend(pred)
+            train_prob.extend(prob_)
         
-        last_loss = running_loss / (i + 1)
+            # if i % show_report == show_report-1:
+            #     # For loss
+            #     last_loss = running_loss / show_report # loss per batch
+            #     # print('  batch {} loss: {}'.format(i + 1, last_loss))
+            #     tb_x = epoch_index * len(train_loader) + i + 1
+            #     tb_writer.add_scalar('Loss/train', last_loss, tb_x)
+            #     running_loss = 0.
+        
+        avg_loss = running_loss / valid_batches if valid_batches > 0 else float('inf')
+
+        # Calculate metrics for the training phase
+        train_accuracy = accuracy_score(train_gt, train_pred)
+        train_precision = precision_score(train_gt, train_pred)
+        train_recall = recall_score(train_gt, train_pred)
+        train_f1 = f1_score(train_gt, train_pred)
+        
+        train_auc = roc_auc_score(train_gt, train_prob) # if len(set(train_gt)) > 1 else 0.0  # avoid AUC error in single-class cases
+        
+        return avg_loss, train_accuracy, train_precision, train_recall, train_f1, train_auc
     
-        return last_loss
     
     
     # Create StratifiedKFold object
-    list_for_val_result_df = [] # it will store all val_dfs
-    list_for_val_cr_df = []
+    list_for_val_result_df = [] # it will store the best results for validation
+    list_for_val_preds_df = [] # it will store all validation predictions and probabilities
+    # list_for_val_cr_df = []
     
-    k = 5  # Number of folds
+    k = config.train.kfold  # Number of folds
     skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=42)
     
     # Subplots for training and validation loss
@@ -321,7 +367,6 @@ if config.phase == "train" or config.phase == "both":
     
         "Create directories"
         val_result_save_dir = os.path.join(result_dir, base_model_name, 'results_val')
-        writer_dir = os.path.join(result_dir, base_model_name, 'logs')
         save_fig_dir = os.path.join(result_dir, base_model_name, "plots")
     
         os.makedirs(val_result_save_dir, exist_ok=True)
@@ -386,17 +431,19 @@ if config.phase == "train" or config.phase == "both":
         # ============================== Train N epochs ============================== #
         # ============================================================================ #
         start = time.time() # start of training
-        
-        # timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        # writer = SummaryWriter('runs/fashion_trainer_{}'.format(timestamp))
-        writer = SummaryWriter(os.path.join(writer_dir, 'fashion_trainer_{}'.format(timestamp)))
-        
+    
         best_vloss = 1_000_000.
+        best_val_accuracy = 0.
+        best_val_precision = 0.
+        best_val_recall = 0.
+        best_val_f1 = 0.
+        best_val_auc = 0.
         save_model = False # initially it is False
         cnt_patience = 0
         initial_epoch = 0
         
         store_train_loss, store_val_loss = [], []
+        store_epochs = []
         
         for epoch in range(initial_epoch, EPOCHS):
             print('EPOCH {}:'.format(epoch + 1))
@@ -405,14 +452,15 @@ if config.phase == "train" or config.phase == "both":
             # Make sure gradient tracking is on, and do a pass over the data
             model.train()
             # avg_loss = train_one_epoch(epoch, writer)
-            avg_loss = train_one_epoch(epoch) ############### turned off writer
+            avg_loss, train_accuracy, train_precision, train_recall, train_f1, train_auc = train_one_epoch(epoch) ############### turned off writer
         
             store_train_loss.append(avg_loss) # average loss is not a tensor
         
             # Validation phase
             # We don't need gradients on to do reporting
             model.eval()
-        
+
+            running_val_gt, running_val_pred, running_val_prob = [], [], []
             with torch.no_grad():
               running_vloss = 0.0
         
@@ -431,11 +479,11 @@ if config.phase == "train" or config.phase == "both":
     
                   # Hard prediction (meaning 0 or 1)
                   if ONE_HOT:
-                      vout = torch.argmax(voutputs, dim=1).data.cpu().numpy().tolist()
+                      vout = torch.argmax(vprob, dim=1).data.cpu().numpy().tolist() # making prediction from probability
                       vlbls = torch.argmax(vlabels, dim=1).data.cpu().numpy().tolist()
                       vprob = vprob[:, 1].data.cpu().numpy().tolist() #<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< attention: for 2 classes
                   else:
-                      vout = (voutputs > 0.5).float().data.cpu().numpy().tolist() # **************************** .squeeze()
+                      vout = (vprob > 0.5).float().data.cpu().numpy().tolist() # **************************** .squeeze()
                       vlbls = vlabels.data.cpu().numpy().tolist()
                       vprob = vprob.data.cpu().numpy().tolist()
     
@@ -443,19 +491,34 @@ if config.phase == "train" or config.phase == "both":
                   val_pred.extend(vout)
                   val_prob.extend(vprob)
                   val_names.extend(vnames)
+                  store_epochs.extend([epoch]*len(vnames))
+
+                  running_val_gt.extend(vlbls)
+                  running_val_pred.extend(vout)
+                  running_val_prob.extend(vprob)
         
             avg_vloss = running_vloss / (i + 1)
-            print('LOSS train {} valid {}'.format(avg_loss, avg_vloss))
         
             store_val_loss.append(avg_vloss.data.cpu().numpy().tolist()) # avg_vloss is a tensor and in gpu
         
-            # Log the running loss averaged per batch
-            # for both training and validation
-            writer.add_scalars('Training vs. Validation Loss',
-                            { 'Training' : avg_loss, 'Validation' : avg_vloss },
-                            epoch + 1)
-            writer.flush()
+            # Calculate metrics for the running epoch
+            running_val_accuracy = accuracy_score(running_val_gt, running_val_pred)
+            running_val_precision = precision_score(running_val_gt, running_val_pred)
+            running_val_recall = recall_score(running_val_gt, running_val_pred)
+            running_val_f1 = f1_score(running_val_gt, running_val_pred)
+            running_val_auc = roc_auc_score(running_val_gt, running_val_prob)
+
+            print(f"Loss train {avg_loss} valid {avg_vloss}, vAccuracy: {running_val_accuracy}, vPrecision: {running_val_precision}, vRecall: {running_val_recall}, vF1: {running_val_f1}, vAUC: {running_val_auc}") 
             
+            "Log metrics to TensorBoard"
+            writer.add_scalars(f'Loss/Fold{fold+1}', {'training': avg_loss, 'validation': avg_vloss}, epoch + 1)
+            writer.add_scalars(f'Metrics/Accuracy/Fold{fold+1}', {'training': train_accuracy, 'validation': running_val_accuracy}, epoch + 1)
+            writer.add_scalars(f'Metrics/Precision/Fold{fold+1}', {'training': train_precision, 'validation': running_val_precision}, epoch + 1)
+            writer.add_scalars(f'Metrics/Recall/Fold{fold+1}', {'training': train_recall, 'validation': running_val_recall}, epoch + 1)
+            writer.add_scalars(f'Metrics/F1_Score/Fold{fold+1}', {'training': train_f1, 'validation': running_val_f1}, epoch + 1)
+            writer.add_scalars(f'Metrics/AUC/Fold{fold+1}', {'training': train_auc, 'validation': running_val_auc}, epoch + 1)
+
+            writer.flush()
         
             # Track best performance, and save the model's state
             if avg_vloss < best_vloss:
@@ -464,7 +527,13 @@ if config.phase == "train" or config.phase == "both":
                 cnt_patience = 0 # reset patience
                 best_model_epoch = epoch
                 save_model = True
-        
+                # Store metrics for the best model
+                val_accuracy = running_val_accuracy
+                val_precision = running_val_precision
+                val_recall = running_val_recall
+                val_f1 = running_val_f1
+                val_auc = running_val_auc
+                
             else: cnt_patience += 1
         
             # Learning rate scheduler
@@ -509,54 +578,54 @@ if config.phase == "train" or config.phase == "both":
         plt.tight_layout()
         
         "Validation evaluation"     
-        # Confusion matrix and classification report
-        cm = confusion_matrix(val_gt, val_pred) # confusion matrix    
-        cr = classification_report(val_gt, val_pred, labels=[0, 1], output_dict=True) # classification report    
-        val_cm_df = pd.DataFrame(cr).transpose() # convert confusion matrix to dataframe    
-        list_for_val_cr_df.append(val_cm_df)
+        # # Confusion matrix and classification report
+        # cm = confusion_matrix(val_gt, val_pred) # confusion matrix    
+        # cr = classification_report(val_gt, val_pred, labels=[0, 1], output_dict=True) # classification report    
+        # val_cm_df = pd.DataFrame(cr).transpose() # convert confusion matrix to dataframe    
+        # list_for_val_cr_df.append(val_cm_df)
     
-        # Precision, recall, F1, accuracy
-        precision = precision_score(val_gt, val_pred)
-        recall = recall_score(val_gt, val_pred)
-        f1 = f1_score(val_gt, val_pred)
-        accuracy = accuracy_score(val_gt, val_pred)
+        # # Precision, recall, F1, accuracy
+        # precision = precision_score(val_gt, val_pred)
+        # recall = recall_score(val_gt, val_pred)
+        # f1 = f1_score(val_gt, val_pred)
+        # accuracy = accuracy_score(val_gt, val_pred)
     
-        # AUC
-        auc = roc_auc_score(val_gt, val_prob)
+        # # AUC
+        # auc = roc_auc_score(val_gt, val_prob)
     
-        print("vPrecision:", precision, "vRecall:", recall, "vF1:", f1, "vAccuracy:", accuracy, "vAUC:", auc)
+        # print("vPrecision:", precision, "vRecall:", recall, "vF1:", f1, "vAccuracy:", accuracy, "vAUC:", auc)
     
         "Store in excel"
         val_results_df = pd.DataFrame(
                     {
-                        "Model name": model_name,
-                        "Names": val_names,
-                        "Label": val_gt,
-                        "Prediction": val_pred,
-                        "Probability": val_prob,
-                        "Accuracy": accuracy,
-                        "Precision": precision,
-                        "Recall": recall,
-                        "F1 Score": f1,
-                        "AUC": auc,
+                        "Model name": [model_name],
+                        "Accuracy": val_accuracy,
+                        "Precision": val_precision,
+                        "Recall": val_recall,
+                        "F1 Score": val_f1,
+                        "AUC": val_auc,
                         "Best epoch": best_model_epoch,
                         "Min train loss": np.min(store_train_loss),
-                        "Min val loss": np.min(store_val_loss),
-                        "Batch": BATCH_SIZE,
-                        "Onehot": ONE_HOT,
-                        "LR": LR,
-                        "Weight_decay": WEIGHT_DECAY,
-                        "Loss": config.loss.name,
+                        "Min val loss": np.min(store_val_loss), # or [best_vloss.data.cpu().numpy()]
                         "Optimizer": "Adam",
                         "Scheduler": "ReduceLROnPlateau",
                         "Time": exe_time,
-                        "Out_chs": str(OUT_CHS),
-                        "Droput": DROPOUT,
                      }
                 )
+
+        val_preds_df = pd.DataFrame(
+            {
+                "Model name": model_name,
+                "Epoch": store_epochs,
+                "Names": val_names,
+                "Label": val_gt,
+                "Prediction": val_pred,
+                "Probability": val_prob,
+            }
+        )
     
-        list_for_val_result_df.append(val_results_df)    
-        # val_results_df.to_excel(os.path.join(val_result_save_dir, model_name + '_fold' + str(fold) + ".xlsx"))
+        list_for_val_result_df.append(val_results_df)  
+        list_for_val_preds_df.append(val_preds_df)    
     
     # fold = 0 # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< reset fold so that for loops run only one iteration
     
@@ -564,32 +633,12 @@ if config.phase == "train" or config.phase == "both":
     with pd.ExcelWriter(os.path.join(val_result_save_dir, base_model_name + "_val.xlsx"), engine='xlsxwriter') as xl_writer:
         for idx, vdf in enumerate(list_for_val_result_df):
             vdf.to_excel(xl_writer, sheet_name=f'fold{idx + 1}', index=False)
-    
-    with pd.ExcelWriter(os.path.join(val_result_save_dir, base_model_name + '_creport' + "_val.xlsx"), engine='xlsxwriter') as xl_writer:
-        for idx, vdf in enumerate(list_for_val_cr_df):
-            vdf.to_excel(xl_writer, sheet_name=f'fold{idx + 1}', index=True)
+
+    with pd.ExcelWriter(os.path.join(val_result_save_dir, base_model_name + "_preds_val.xlsx"), engine='xlsxwriter') as xl_writer:
+        for idx, vdf in enumerate(list_for_val_preds_df):
+            vdf.to_excel(xl_writer, sheet_name=f'fold{idx + 1}', index=False)
     
     fig.savefig(os.path.join(save_fig_dir, base_model_name + '.png')) # saving loss curves
-    
-    "Save ROC for validation data"
-    plt.figure(figsize=(8, 6))
-    for fold, vdf in enumerate(list_for_val_result_df):
-    
-        if not ONE_HOT:
-            # Flatten the 'Probability' column to extract the scalar values from the lists
-            vdf['Probability'] = vdf['Probability'].apply(lambda x: x[0] if isinstance(x, list) else x).astype(float)
-            # Flatten the 'Label' column to extract the scalar values from the lists
-            vdf['Label'] = vdf['Label'].apply(lambda x: x[0] if isinstance(x, list) else x).astype(int)
-    
-        fpr, tpr, _ = roc_curve(vdf['Label'], vdf['Probability'])
-        plt.plot(fpr, tpr, lw=2, label=f'Fold {fold + 1} (AUC = {vdf["AUC"].iloc[0]:.2f})')
-    
-    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random')
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('ROC Curve for K-Folds')
-    plt.legend(loc='lower right')
-    plt.savefig(os.path.join(save_fig_dir, base_model_name + '_roc_kfolds_val.png'))
 
     print("*"*20, "Training done", "*"*20)
 else:
@@ -704,11 +753,11 @@ if config.phase == "both" or config.phase == "test":
                 
                 if ONE_HOT:
                     pred_prob = test_prob[:, 1].data.cpu().numpy().tolist()  # Probability of the positive class (malignant) #<<<<<<<<<<< for 2-cls
-                    pred_class = torch.argmax(toutputs, dim=1).data.cpu().numpy().tolist()  # Hard prediction
+                    pred_class = torch.argmax(test_prob, dim=1).data.cpu().numpy().tolist()  # Hard prediction # making prediction from probability
                     tlabels = torch.argmax(tlabels, dim=1).data.cpu().numpy().tolist()
                 else:
                     pred_prob = test_prob.data.cpu().numpy().squeeze()  # Probability of the positive class (malignant)
-                    pred_class = (toutputs > 0.5).float().data.cpu().numpy().squeeze()
+                    pred_class = (test_prob > 0.5).float().data.cpu().numpy().squeeze() # making prediction from probability
                     tlabels = tlabels.data.cpu().numpy().squeeze()
             
                 # Collect results
@@ -729,17 +778,22 @@ if config.phase == "both" or config.phase == "test":
         
         df_test_.to_excel(os.path.join(test_save_dir, base_model_name + "_avg.xlsx"))
         
-        # Precision, recall, F1, accuracy, and AUC
+        "Confusion matrix, specificity, precision, recall, F1, accuracy, and AUC"
         y_true = df_test_["Label"].tolist()
         y_pred = df_test_["Prediction"].tolist()
         y_pred_probs = df_test_["Predicted Probability"].tolist()
         
+        cm = confusion_matrix(y_true, y_pred) # Confusion matrix
+        tn, fp, fn, tp = cm.ravel()  # Unpack confusion matrix values
+        
+        specificity = tn / (tn + fp)                    #>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Pay attention: Specificity for binary classification !!!!!!!!!
         precision = precision_score(y_true, y_pred)
         recall = recall_score(y_true, y_pred)
         f1 = f1_score(y_true, y_pred)
         accuracy = accuracy_score(y_true, y_pred)
         auc_value = roc_auc_score(y_true, y_pred_probs)
         
+        print("specificity:", specificity)
         print("Precision:", precision)
         print("Recall:", recall)
         print("F1 Score:", f1)
@@ -751,6 +805,7 @@ if config.phase == "both" or config.phase == "test":
             {
                 "Model name": [model_name],
                 "Accuracy": [accuracy],
+                "Specificity": [specificity],
                 "Precision": [precision],
                 "Recall": [recall],
                 "F1 Score": [f1],
@@ -759,9 +814,6 @@ if config.phase == "both" or config.phase == "test":
         )
         
         test_results_df.to_excel(os.path.join(test_save_dir, base_model_name + "_metrics_avg.xlsx"))
-        
-        # Confusion matrix
-        cm = confusion_matrix(y_true, y_pred)
         
         # Plot confusion matrix
         plt.figure(figsize=(8, 6))
@@ -817,9 +869,7 @@ if config.phase == "both" or config.phase == "test":
                 tinputs = tinputs.to(DEVICE)
                 tlabels = tlabels.to(DEVICE)
         
-                # Prediction
-                store_pred = []
-                    
+                # Prediction 
                 toutputs = model(tinputs)
         
                 # Probabilities
@@ -827,11 +877,11 @@ if config.phase == "both" or config.phase == "test":
                 
                 if ONE_HOT:
                     pred_prob = test_prob[:, 1].data.cpu().numpy().tolist()  # Probability of the positive class (malignant) #<<<<<<<<<<< for 2-cls
-                    pred_class = torch.argmax(toutputs, dim=1).data.cpu().numpy().tolist()  # Hard prediction
+                    pred_class = torch.argmax(test_prob, dim=1).data.cpu().numpy().tolist()  # Hard prediction
                     tlabels = torch.argmax(tlabels, dim=1).data.cpu().numpy().tolist()
                 else:
                     pred_prob = test_prob.data.cpu().numpy().squeeze()  # Probability of the positive class (malignant)
-                    pred_class = (toutputs > 0.5).float().data.cpu().numpy().squeeze()
+                    pred_class = (test_prob > 0.5).float().data.cpu().numpy().squeeze() # making prediction from probability
                     tlabels = tlabels.data.cpu().numpy().squeeze()
             
                 # Collect results
@@ -852,17 +902,22 @@ if config.phase == "both" or config.phase == "test":
         
         df_test_.to_excel(os.path.join(test_save_dir, base_model_name + "_best_model.xlsx"))
         
-        # Precision, recall, F1, accuracy, and AUC
+        "Confusion matrix, specificity, precision, recall, F1, accuracy, and AUC"
         y_true = df_test_["Label"].tolist()
         y_pred = df_test_["Prediction"].tolist()
         y_pred_probs = df_test_["Predicted Probability"].tolist()
         
+        cm = confusion_matrix(y_true, y_pred) # Confusion matrix
+        tn, fp, fn, tp = cm.ravel()  # Unpack confusion matrix values
+        
+        specificity = tn / (tn + fp)                      # >>>>>>>>>>>>>>>>>>>> Pay attention: Specificity for binary classification !!!!!!!!!
         precision = precision_score(y_true, y_pred)
         recall = recall_score(y_true, y_pred)
         f1 = f1_score(y_true, y_pred)
         accuracy = accuracy_score(y_true, y_pred)
         auc_value = roc_auc_score(y_true, y_pred_probs)
         
+        print("Specificity:", specificity)
         print("Precision:", precision)
         print("Recall:", recall)
         print("F1 Score:", f1)
@@ -874,6 +929,7 @@ if config.phase == "both" or config.phase == "test":
             {
                 "Model name": [best_model_name],
                 "Accuracy": [accuracy],
+                "Specificity": [specificity],
                 "Precision": [precision],
                 "Recall": [recall],
                 "F1 Score": [f1],
@@ -882,9 +938,6 @@ if config.phase == "both" or config.phase == "test":
         )
         
         test_results_df.to_excel(os.path.join(test_save_dir, base_model_name + '_metrics_best_model.xlsx'))
-        
-        # Confusion matrix
-        cm = confusion_matrix(y_true, y_pred)
         
         # Plot confusion matrix
         plt.figure(figsize=(8, 6))
